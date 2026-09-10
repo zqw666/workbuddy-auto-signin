@@ -1,0 +1,33 @@
+name: WorkBuddy 每日签到
+
+on:
+  schedule:
+    - cron: "5 16 * * *"   # 北京时间 00:05 (UTC 16:05)
+    - cron: "0 0 * * *"    # 北京时间 08:00 (UTC 00:00)
+  workflow_dispatch:        # 可手动触发
+
+jobs:
+  signin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 执行签到
+        env:
+          WORKBUDDY_AUTH_JSON: ${{ secrets.WORKBUDDY_AUTH_JSON }}
+        run: python signin.py silent
+
+      - name: 输出日志
+        if: always()
+        run: |
+          if [ -f signin.log ]; then
+            cat signin.log
+          else
+            echo "signin.log 不存在，检查上面步骤的输出"
+          fi
