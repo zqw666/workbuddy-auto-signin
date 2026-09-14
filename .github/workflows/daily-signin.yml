@@ -9,6 +9,7 @@ on:
 jobs:
   signin:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -18,10 +19,77 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 执行签到
+      # signin.py 只认「凭据文件路径」——环境变量 WORKBUDDY_AUTH_FILE，或四个平台默认
+      # 路径。它不认识 WORKBUDDY_AUTH_JSON 这个变量名，所以把 secret 直接挂在 env 里
+      # 不会生效（历史失败全部是 NO_AUTH）。这里先落盘成桌面端同名的凭据文件：
+      # $HOME/.workbuddy/auth/workbuddy-desktop.info 正是脚本的兜底探测路径。
+      - name: 准备登录凭据
         env:
           WORKBUDDY_AUTH_JSON: ${{ secrets.WORKBUDDY_AUTH_JSON }}
-        run: python signin.py silent
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WORKBUDDY_AUTH_JSON:-}" ]; then
+            echo "::error::Secret WORKBUDDY_AUTH_JSON 为空。请在仓库 Settings > Secrets and variables > Actions 中填入 workbuddy-desktop.info 的完整 JSON 内容。"
+            exit 1
+          fi
+
+          AUTH_FILE="$HOME/.workbuddy/auth/workbuddy-desktop.info"
+          mkdir -p "$(dirname "$AUTH_FILE")"
+          printf '%s' "$WORKBUDDY_AUTH_JSON" > "$AUTH_FILE"
+          chmod 600 "$AUTH_FILE"
+
+          # 提前校验格式，把「token 过期 / 粘错内容」和「代码逻辑问题」区分开。
+          # 注意字段位置：令牌在 auth.accessToken，账号在 account.uid（不是 auth.uid，
+          # 写成 auth.uid 会在 build_headers 里被判 NO_SESSION）。
+          python - "$AUTH_FILE" <<'PY'
+          import datetime
+          import json
+          import sys
+
+          path = sys.argv[1]
+          try:
+              with open(path, "r", encoding="utf-8") as f:
+                  session = json.load(f)
+          except Exception as exc:
+              print("::error::Secret 不是合法 JSON（%s）。应填入 workbuddy-desktop.info 的完整原文内容，"
+                    "而不是单独的 token 字符串。" % exc)
+              sys.exit(1)
+
+          auth = session.get("auth") or {}
+          account = session.get("account") or {}
+          if not auth.get("accessToken") or not account.get("uid"):
+              print("::error::凭据缺少 auth.accessToken 或 account.uid，请从本机 "
+                    "%LOCALAPPDATA%\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info "
+                    "重新复制完整内容后更新 Secret。")
+              sys.exit(1)
+
+          uid = str(account.get("uid"))
+          masked = uid[:4] + "****" + uid[-4:] if len(uid) > 8 else "****"
+          exp = auth.get("expiresAt")
+          if isinstance(exp, (int, float)):
+              when = datetime.datetime.fromtimestamp(exp / 1000, datetime.timezone.utc)
+              left = when - datetime.datetime.now(datetime.timezone.utc)
+              if left.days < 0:
+                  print("::warning::凭据校验通过（uid=%s），但 accessToken 已于 %s 过期，"
+                        "运行大概率会返回 NO_SESSION，请重新登录桌面端并更新 Secret。"
+                        % (masked, when.strftime("%Y-%m-%d")))
+              else:
+                  print("凭据校验通过：uid=%s accessToken 到期=%s（约剩 %s 天）"
+                        % (masked, when.strftime("%Y-%m-%d"), left.days))
+                  if left.days < 3:
+                      print("::warning::accessToken 将在 3 天内过期，请重新登录桌面端并更新 Secret，"
+                            "否则后续运行会变成 NO_SESSION。")
+          else:
+              print("凭据校验通过：uid=%s（凭据未提供 expiresAt，无法预判过期）" % masked)
+          PY
+
+      # 这一步不再注入 secret：脚本通过 WORKBUDDY_AUTH_FILE 指向的文件读凭据，
+      # 最小化敏感值暴露面。
+      - name: 执行签到
+        run: |
+          export WORKBUDDY_AUTH_FILE="$HOME/.workbuddy/auth/workbuddy-desktop.info"
+          python signin.py silent
 
       - name: 输出日志
         if: always()
@@ -31,3 +99,7 @@ jobs:
           else
             echo "signin.log 不存在，检查上面步骤的输出"
           fi
+
+      - name: 清理凭据
+        if: always()
+        run: rm -f "$HOME/.workbuddy/auth/workbuddy-desktop.info"
