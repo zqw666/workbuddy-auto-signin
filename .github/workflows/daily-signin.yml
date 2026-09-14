@@ -5,11 +5,20 @@ on:
     - cron: "5 16 * * *"   # 北京时间 00:05 (UTC 16:05)
     - cron: "0 0 * * *"    # 北京时间 08:00 (UTC 00:00)
   workflow_dispatch:        # 可手动触发
+    inputs:
+      force_fail:
+        description: "测试用：跳过签到直接失败，用来验证告警 issue 链路是否真的通"
+        type: boolean
+        default: false
 
 jobs:
   signin:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # 开 issue 告警需要 issues: write；显式声明权限，不用默认的宽松授权
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -88,6 +97,10 @@ jobs:
       # 最小化敏感值暴露面。
       - name: 执行签到
         run: |
+          if [ "${{ inputs.force_fail }}" = "true" ]; then
+            echo "::error::force_fail=true：跳过签到直接失败，用于验证「失败开 issue」链路。"
+            exit 1
+          fi
           export WORKBUDDY_AUTH_FILE="$HOME/.workbuddy/auth/workbuddy-desktop.info"
           python signin.py silent
 
@@ -103,3 +116,94 @@ jobs:
       - name: 清理凭据
         if: always()
         run: rm -f "$HOME/.workbuddy/auth/workbuddy-desktop.info"
+
+      # 告警放在同一个 job 内：能直接读到 signin.log 里的失败原因，不必再传 artifact。
+      # 失败 → 在没有未关闭告警 issue 时新建，否则追加评论（避免每天刷出两条新 issue）；
+      # 成功 → 自动关闭历史告警，恢复即销警。
+      # 用 python3 而不是 python：即使 setup-python 没跑成，runner 自带的 python3 也在。
+      - name: 失败告警 / 成功销警
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          STATUS = os.environ.get("JOB_STATUS", "")
+          REPO = os.environ.get("GITHUB_REPOSITORY", "")
+          TITLE = "[自动签到] 运行失败"
+          RUN_URL = os.environ.get("RUN_URL", "")
+          BODY_FILE = pathlib.Path("issue-body.md")
+
+
+          def gh(*args):
+              """调用 gh CLI；失败时把 stderr 原样抛出，别把告警问题再静默吞掉。"""
+              return subprocess.run(["gh", *args], check=True, text=True, capture_output=True)
+
+
+          def find_open_issue():
+              raw = gh("issue", "list", "--repo", REPO, "--state", "open",
+                       "--limit", "100", "--json", "number,title").stdout or "[]"
+              for item in json.loads(raw):
+                  if item.get("title") == TITLE:
+                      return item.get("number")
+              return None
+
+
+          def failure_body():
+              tail = ""
+              log = pathlib.Path("signin.log")
+              if log.exists():
+                  text = log.read_text(encoding="utf-8", errors="replace").strip()
+                  if text:
+                      tail = text[-2000:]
+              if not tail:
+                  tail = ("没有 signin.log：脚本在写日志之前就退出了（多半卡在准备凭据步骤），"
+                          "请打开本次运行记录看前面的步骤日志。")
+
+              now = datetime.datetime.now(datetime.timezone.utc)
+              bj = now.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+              return (
+                  "## 自动签到运行失败\n\n"
+                  "| 项 | 值 |\n"
+                  "| --- | --- |\n"
+                  "| 时间（北京时间） | %s |\n" % bj.strftime("%Y-%m-%d %H:%M:%S")
+                  + "| 触发方式 | `%s` |\n" % os.environ.get("TRIGGER", "")
+                  + "| 运行记录 | %s |\n\n" % RUN_URL
+                  + "<details><summary>signin.log 末尾</summary>\n\n"
+                  + "```\n%s\n```\n\n" % tail
+                  + "</details>\n\n"
+                  + "_修好之后，第一次成功运行会自动关闭本 issue。_\n"
+              )
+
+
+          if STATUS == "failure":
+              BODY_FILE.write_text(failure_body(), encoding="utf-8")
+              num = find_open_issue()
+              if num:
+                  gh("issue", "comment", str(num), "--repo", REPO,
+                     "--body-file", str(BODY_FILE))
+                  print("已把本次失败追加到告警 issue #%s" % num)
+              else:
+                  created = gh("issue", "create", "--repo", REPO, "--title", TITLE,
+                               "--body-file", str(BODY_FILE)).stdout.strip()
+                  print("已创建告警 issue：%s" % created)
+          elif STATUS == "success":
+              num = find_open_issue()
+              if num:
+                  gh("issue", "close", str(num), "--repo", REPO,
+                     "--comment", "本次运行已成功（%s），自动关闭该告警。" % RUN_URL)
+                  print("已关闭历史告警 issue #%s" % num)
+              else:
+                  print("运行成功，且没有未关闭的告警 issue。")
+          else:
+              print("任务状态为 %s，不处理告警。" % (STATUS or "未知"))
+          PY
