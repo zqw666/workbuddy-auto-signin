@@ -166,8 +166,9 @@ jobs:
                   if text:
                       tail = text[-2000:]
               if not tail:
-                  tail = ("没有 signin.log：脚本在写日志之前就退出了（多半卡在准备凭据步骤），"
-                          "请打开本次运行记录看前面的步骤日志。")
+                  tail = ("没有 signin.log：脚本在写日志之前就退出了。"
+                          "常见原因：卡在「准备登录凭据」步骤，或本次是 force_fail 强制失败。"
+                          "请打开上面链接里的运行记录看具体是哪一步。")
 
               now = datetime.datetime.now(datetime.timezone.utc)
               bj = now.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
