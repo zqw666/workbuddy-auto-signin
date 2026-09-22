@@ -28,94 +28,192 @@ jobs:
         with:
           python-version: "3.11"
 
-      # signin.py 只认「凭据文件路径」——环境变量 WORKBUDDY_AUTH_FILE，或四个平台默认
-      # 路径。它不认识 WORKBUDDY_AUTH_JSON 这个变量名，所以把 secret 直接挂在 env 里
-      # 不会生效（历史失败全部是 NO_AUTH）。这里先落盘成桌面端同名的凭据文件：
-      # $HOME/.workbuddy/auth/workbuddy-desktop.info 正是脚本的兜底探测路径。
-      - name: 准备登录凭据
+      # ── 多账号说明 ────────────────────────────────────────────────────────
+      # GitHub Actions 的 secrets 上下文**不支持**动态取值（secrets[matrix.x] 无效），
+      # 所以没法用 matrix 一个账号配一个 secret。这里改成：单个 secret 里放
+      # 多份凭据，在 job 内拆开分别跑。
+      #
+      # Secret 名：WORKBUDDY_AUTH_JSON，内容支持两种格式，老格式仍然兼容：
+      #   ① 单账号（现状）—— 顶层就是一份 workbuddy-desktop.info 的完整 JSON
+      #   ② 多账号 ──────── 顶层是 { "标签": <完整JSON>, "标签2": <完整JSON> }
+      #      标签只用来区分日志和提示，随便起（如 zqw / work / friend）
+      #
+      # 每个账号单独落盘成 <标签>.info，脚本靠 WORKBUDDY_AUTH_FILE 逐账号读取。
+      - name: 准备登录凭据（支持多账号）
         env:
           WORKBUDDY_AUTH_JSON: ${{ secrets.WORKBUDDY_AUTH_JSON }}
         run: |
           set -euo pipefail
 
           if [ -z "${WORKBUDDY_AUTH_JSON:-}" ]; then
-            echo "::error::Secret WORKBUDDY_AUTH_JSON 为空。请在仓库 Settings > Secrets and variables > Actions 中填入 workbuddy-desktop.info 的完整 JSON 内容。"
+            echo "::error::Secret WORKBUDDY_AUTH_JSON 为空。请在仓库 Settings > Secrets and variables > Actions 中填入 workbuddy-desktop.info 的完整 JSON 内容（多账号则填 { \"标签\": <JSON>, ... }）。"
             exit 1
           fi
 
-          AUTH_FILE="$HOME/.workbuddy/auth/workbuddy-desktop.info"
-          mkdir -p "$(dirname "$AUTH_FILE")"
-          printf '%s' "$WORKBUDDY_AUTH_JSON" > "$AUTH_FILE"
-          chmod 600 "$AUTH_FILE"
+          AUTH_DIR="$RUNNER_TEMP/wbauth"
+          rm -rf "$AUTH_DIR"
+          mkdir -p "$AUTH_DIR"
+          printf '%s' "$WORKBUDDY_AUTH_JSON" > "$AUTH_DIR/raw.json"
 
-          # 提前校验格式，把「token 过期 / 粘错内容」和「代码逻辑问题」区分开。
-          # 注意字段位置：令牌在 auth.accessToken，账号在 account.uid（不是 auth.uid，
-          # 写成 auth.uid 会在 build_headers 里被判 NO_SESSION）。
-          python - "$AUTH_FILE" <<'PY'
+          # 拆包 + 逐账号校验。令牌在 auth.accessToken，账号在 account.uid
+          # （写成 auth.uid 会在 build_headers 里被判 NO_SESSION）。
+          # 单个账号有问题不让它拖垮其它账号：坏账号记进 bad.txt，最后统一失败。
+          python - "$AUTH_DIR/raw.json" "$AUTH_DIR" <<'PY'
           import datetime
           import json
+          import os
+          import re
           import sys
 
-          path = sys.argv[1]
+          src, outdir = sys.argv[1], sys.argv[2]
+          os.makedirs(outdir, exist_ok=True)
+
           try:
-              with open(path, "r", encoding="utf-8") as f:
-                  session = json.load(f)
+              with open(src, "r", encoding="utf-8-sig") as f:
+                  raw = json.load(f)
           except Exception as exc:
               print("::error::Secret 不是合法 JSON（%s）。应填入 workbuddy-desktop.info 的完整原文内容，"
                     "而不是单独的 token 字符串。" % exc)
               sys.exit(1)
 
-          auth = session.get("auth") or {}
-          account = session.get("account") or {}
-          if not auth.get("accessToken") or not account.get("uid"):
-              print("::error::凭据缺少 auth.accessToken 或 account.uid，请从本机 "
-                    "%LOCALAPPDATA%\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info "
-                    "重新复制完整内容后更新 Secret。")
+          # 格式判别：顶层直接带 auth.accessToken 就是单账号，否则按「标签 -> 凭据」解析
+          if not isinstance(raw, dict):
+              print("::error::Secret 顶层必须是 JSON 对象。")
+              sys.exit(1)
+          if (raw.get("auth") or {}).get("accessToken"):
+              accounts = {"default": raw}
+              print("识别为单账号格式。")
+          else:
+              accounts = raw
+              print("识别为多账号格式，共 %d 个条目。" % len(accounts))
+
+          if not accounts:
+              print("::error::Secret 里没有任何账号。")
               sys.exit(1)
 
-          uid = str(account.get("uid"))
-          masked = uid[:4] + "****" + uid[-4:] if len(uid) > 8 else "****"
-          exp = auth.get("expiresAt")
-          if isinstance(exp, (int, float)):
-              when = datetime.datetime.fromtimestamp(exp / 1000, datetime.timezone.utc)
-              left = when - datetime.datetime.now(datetime.timezone.utc)
-              if left.days < 0:
-                  print("::warning::凭据校验通过（uid=%s），但 accessToken 已于 %s 过期，"
-                        "运行大概率会返回 NO_SESSION，请重新登录桌面端并更新 Secret。"
-                        % (masked, when.strftime("%Y-%m-%d")))
+          def safe(label, used):
+              """标签 -> 安全文件名；防路径穿越，重名自动加序号。"""
+              name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(label)).strip("._-") or "account"
+              if name in used:
+                  used[name] += 1
+                  name = "%s_%d" % (name, used[name])
               else:
-                  print("凭据校验通过：uid=%s accessToken 到期=%s（约剩 %s 天）"
-                        % (masked, when.strftime("%Y-%m-%d"), left.days))
-                  if left.days < 3:
-                      print("::warning::accessToken 将在 3 天内过期，请重新登录桌面端并更新 Secret，"
-                            "否则后续运行会变成 NO_SESSION。")
-          else:
-              print("凭据校验通过：uid=%s（凭据未提供 expiresAt，无法预判过期）" % masked)
+                  used[name] = 1
+              return name
+
+          used, ok, bad = {}, [], []
+
+          for label in accounts:
+              session = accounts[label]
+              name = safe(label, used)
+              auth = (session or {}).get("auth") or {}
+              account = (session or {}).get("account") or {}
+
+              if not isinstance(session, dict) or not auth.get("accessToken") or not account.get("uid"):
+                  print("::error::账号 [%s] 缺少 auth.accessToken 或 account.uid，已跳过。请从本机 "
+                        "%%LOCALAPPDATA%%\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info "
+                        "重新复制完整内容。" % label)
+                  bad.append(str(label))
+                  continue
+
+              uid = str(account.get("uid"))
+              masked = uid[:4] + "****" + uid[-4:] if len(uid) > 8 else "****"
+              nick = account.get("nickname") or "-"
+              exp = auth.get("expiresAt")
+
+              if isinstance(exp, (int, float)):
+                  when = datetime.datetime.fromtimestamp(exp / 1000, datetime.timezone.utc)
+                  left = (when - datetime.datetime.now(datetime.timezone.utc)).days
+                  if left < 0:
+                      print("::error::账号 [%s] 的 accessToken 已于 %s 过期，已跳过。"
+                            "请重新登录桌面端并更新 Secret。" % (label, when.strftime("%Y-%m-%d")))
+                      bad.append(str(label))
+                      continue
+                  note = "accessToken 到期=%s（剩 %s 天）" % (when.strftime("%Y-%m-%d"), left)
+                  if left < 3:
+                      print("::warning::账号 [%s] 的 accessToken 将在 3 天内过期，请重新登录桌面端"
+                            "并更新 Secret，否则后续运行会变成 NO_SESSION。" % label)
+              else:
+                  note = "凭据未提供 expiresAt，无法预判过期"
+
+              path = os.path.join(outdir, name + ".info")
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(session, f, ensure_ascii=False)
+              os.chmod(path, 0o600)
+
+              print("账号 [%s] 凭据就绪：uid=%s 昵称=%s %s" % (label, masked, nick, note))
+              ok.append(name)
+
+          with open(os.path.join(outdir, "accounts.txt"), "w", encoding="utf-8") as f:
+              f.write("".join(n + "\n" for n in ok))
+          with open(os.path.join(outdir, "bad.txt"), "w", encoding="utf-8") as f:
+              f.write("".join(n + "\n" for n in bad))
+
+          print("汇总：就绪 %d 个，异常 %d 个" % (len(ok), len(bad)))
+          if not ok:
+              print("::error::没有任何可用账号，无法继续。")
+              sys.exit(1)
           PY
 
-      # 这一步不再注入 secret：脚本通过 WORKBUDDY_AUTH_FILE 指向的文件读凭据，
-      # 最小化敏感值暴露面。
-      - name: 执行签到
+      # 这一步不注入 secret：脚本通过 WORKBUDDY_AUTH_FILE 指向的文件读凭据，
+      # 最小化敏感值暴露面。逐账号串行跑，每个账号各自一份日志，最后合并成
+      # signin.log —— 告警步骤不用改就能读到全部失败详情。
+      - name: 执行签到（逐账号）
         run: |
           if [ "${{ inputs.force_fail }}" = "true" ]; then
             echo "::error::force_fail=true：跳过签到直接失败，用于验证「失败开 issue」链路。"
             exit 1
           fi
-          export WORKBUDDY_AUTH_FILE="$HOME/.workbuddy/auth/workbuddy-desktop.info"
-          python signin.py silent
+
+          AUTH_DIR="$RUNNER_TEMP/wbauth"
+          mkdir -p logs
+          failed=0
+
+          if [ -s "$AUTH_DIR/bad.txt" ]; then
+            echo "::error::以下账号凭据有误、本次未执行：$(tr '\n' ' ' < "$AUTH_DIR/bad.txt")"
+            failed=1
+          fi
+
+          while IFS= read -r label; do
+            [ -z "$label" ] && continue
+            echo "──────── 账号：$label ────────"
+            if WORKBUDDY_AUTH_FILE="$AUTH_DIR/$label.info" \
+               WORKBUDDY_SIGNIN_LOG="logs/$label.log" \
+               python signin.py silent; then
+              echo "结果：成功"
+            else
+              echo "::error::账号 $label 运行失败（详见下面日志）"
+              failed=1
+            fi
+            if [ -f "logs/$label.log" ]; then
+              cat "logs/$label.log"
+            else
+              echo "（账号 $label 没有产生日志：脚本在写日志之前就退出了）"
+            fi
+          done < "$AUTH_DIR/accounts.txt"
+
+          : > signin.log
+          for f in logs/*.log; do
+            if [ -f "$f" ]; then
+              echo "===== $f =====" >> signin.log
+              cat "$f" >> signin.log
+            fi
+          done
+
+          exit $failed
 
       - name: 输出日志
         if: always()
         run: |
-          if [ -f signin.log ]; then
+          if [ -s signin.log ]; then
             cat signin.log
           else
-            echo "signin.log 不存在，检查上面步骤的输出"
+            echo "signin.log 为空或不存在，检查上面步骤的输出"
           fi
 
       - name: 清理凭据
         if: always()
-        run: rm -f "$HOME/.workbuddy/auth/workbuddy-desktop.info"
+        run: rm -rf "$RUNNER_TEMP/wbauth"
 
       # 告警放在同一个 job 内：能直接读到 signin.log 里的失败原因，不必再传 artifact。
       # 失败 → 在没有未关闭告警 issue 时新建，否则追加评论（避免每天刷出两条新 issue）；
@@ -167,7 +265,8 @@ jobs:
                       tail = text[-2000:]
               if not tail:
                   tail = ("没有 signin.log：脚本在写日志之前就退出了。"
-                          "常见原因：卡在「准备登录凭据」步骤，或本次是 force_fail 强制失败。"
+                          "常见原因：卡在「准备登录凭据」步骤（凭据格式错误或全部过期），"
+                          "或本次是 force_fail 强制失败。"
                           "请打开上面链接里的运行记录看具体是哪一步。")
 
               now = datetime.datetime.now(datetime.timezone.utc)
