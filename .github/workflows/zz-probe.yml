@@ -1,3 +1,8 @@
 name: Probe
-on:/n  workflow_dispatch:/njobs:/n  t:/n    runs-on: ubuntu-latest
-    steps:/n      - run: echo hello
+on:
+  workflow_dispatch:
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
